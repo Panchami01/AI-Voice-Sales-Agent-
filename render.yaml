@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: riverstone-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: RUN_MODE
+        value: http
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: ""   # fill with API URL after first deploy
+      - key: PUBLIC_WS_URL
+        value: ""   # fill with WS URL after first deploy
+
+  - type: web
+    name: riverstone-ws
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: RUN_MODE
+        value: ws
+      - key: DEEPGRAM_API_KEY
+        sync: false
