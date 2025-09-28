@@ -7,6 +7,9 @@ services:
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
     plan: free        # or starter/standard depending on usage
     envVars:
       - key: RUN_MODE
@@ -36,5 +39,6 @@ services:
         value: wss://ai-voice-sales-agent-ws.onrender.com/twilio
       - key: DEEPGRAM_API_KEY
         sync: false
+
 
 
