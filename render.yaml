@@ -1,28 +1,40 @@
 services:
+  # ------------------------
+  # API Service (HTTP layer)
+  # ------------------------
   - type: web
-    name: riverstone-api
+    name: ai-voice-sales-agent-api
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    plan: free        # or starter/standard depending on usage
     envVars:
       - key: RUN_MODE
         value: http
-      - key: DEEPGRAM_API_KEY
-        sync: false
       - key: PUBLIC_BASE_URL
-        value: ""   # fill with API URL after first deploy
+        value: https://ai-voice-sales-agent-api.onrender.com
       - key: PUBLIC_WS_URL
-        value: ""   # fill with WS URL after first deploy
+        value: wss://ai-voice-sales-agent-ws.onrender.com/twilio
+      - key: DEEPGRAM_API_KEY
+        sync: false    # mark secret, set in Render dashboard
 
+  # ------------------------
+  # WebSocket Service (Twilio Media Stream bridge)
+  # ------------------------
   - type: web
-    name: riverstone-ws
+    name: ai-voice-sales-agent-ws
     env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
     envVars:
       - key: RUN_MODE
         value: ws
+      - key: PUBLIC_BASE_URL
+        value: https://ai-voice-sales-agent-api.onrender.com
+      - key: PUBLIC_WS_URL
+        value: wss://ai-voice-sales-agent-ws.onrender.com/twilio
       - key: DEEPGRAM_API_KEY
         sync: false
+
+
