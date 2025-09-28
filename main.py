@@ -18,9 +18,9 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DEEPGRAM_API_KEY:
     raise RuntimeError("Missing DEEPGRAM_API_KEY")
 
-PORT = int(os.getenv("PORT", "10000"))  # Render injects PORT
+PORT = int(os.getenv("PORT", "10000"))  # Render injects this automatically
 
-# Directories
+# Paths
 TRANSCRIPTS_DIR = pathlib.Path("transcripts"); TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 CALL_META = {}
 
@@ -43,53 +43,50 @@ def append_transcript(call_sid: str, line: str):
         f.write(line.rstrip() + "\n")
 
 
-# ============== Deepgram Agent Connection ==============
-import websockets as ws_lib
-
-def sts_connect():
-    return ws_lib.connect(
-        "wss://agent.deepgram.com/v1/agent/converse",
-        subprotocols=["token", DEEPGRAM_API_KEY],
-    )
-
 def load_config():
     with open("config.json", "r") as f:
         return json.load(f)
 
+# ==================== Twilio <-> Deepgram bridge ====================
 
-# ============== Media Bridge ==============
-async def handle_barge_in(decoded, twilio_ws, streamsid):
-    if decoded.get("type") == "UserStartedSpeaking":
-        await twilio_ws.send_json({"event": "clear", "streamSid": streamsid})
-
-async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid, call_sid=None):
-    await handle_barge_in(decoded, twilio_ws, streamsid)
+async def handle_text_message(decoded, twilio_ws, streamsid, call_sid=None):
     txt = decoded.get("text") or decoded.get("content")
     if txt and call_sid:
         append_transcript(call_sid, txt)
 
-async def sts_sender(sts_ws, audio_queue: asyncio.Queue):
+async def sts_sender(sts_ws, audio_queue: asyncio.Queue, ready_evt: asyncio.Event):
+    await ready_evt.wait()
+    logging.info("Deepgram ready: starting to forward audio frames")
     while True:
         chunk = await audio_queue.get()
         try:
-            await sts_ws.send(chunk)
+            if sts_ws.closed:
+                break
+            await sts_ws.send(chunk)  # binary μ-law
         except Exception:
             logging.exception("sts_sender failed")
             break
 
-async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_sid: str):
+async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_sid: str, ready_evt: asyncio.Event):
     streamsid = await streamsid_queue.get()
+    first_jsons_to_log = 5
     async for message in sts_ws:
         try:
             if isinstance(message, str):
                 decoded = json.loads(message)
-                await handle_text_message(decoded, twilio_ws, sts_ws, streamsid, call_sid)
+                if first_jsons_to_log > 0:
+                    logging.info("[DG←] %s", json.dumps(decoded)[:800])
+                    first_jsons_to_log -= 1
+                if not ready_evt.is_set():
+                    ready_evt.set()
+                await handle_text_message(decoded, twilio_ws, streamsid, call_sid)
                 continue
-            raw_mulaw = message
+            # Binary audio back from Deepgram -> Twilio
+            payload = base64.b64encode(message).decode("ascii")
             await twilio_ws.send_json({
                 "event": "media",
                 "streamSid": streamsid,
-                "media": {"payload": base64.b64encode(raw_mulaw).decode("ascii")},
+                "media": {"payload": payload},
             })
         except Exception:
             logging.exception("sts_receiver failed")
@@ -102,12 +99,25 @@ async def twilio_ws_handler(request: web.Request):
     call_sid = request.query.get("CallSid")
     audio_q = asyncio.Queue()
     streamsid_q = asyncio.Queue()
+    ready_evt = asyncio.Event()
 
     try:
-        async with sts_connect() as sts_ws:
-            await sts_ws.send(json.dumps(load_config()))
-            t1 = asyncio.create_task(sts_sender(sts_ws, audio_q))
-            t2 = asyncio.create_task(sts_receiver(sts_ws, ws, streamsid_q, call_sid))
+        async with websockets.connect(
+            "wss://agent.deepgram.com/v1/agent/converse",
+            subprotocols=["token", DEEPGRAM_API_KEY],
+        ) as sts_ws:
+            logging.info("Connected to Deepgram Agent WS")
+            cfg = load_config()
+            await sts_ws.send(json.dumps(cfg))
+            logging.info("[DG→] config sent")
+
+            # Start background tasks
+            t1 = asyncio.create_task(sts_sender(sts_ws, audio_q, ready_evt))
+            t2 = asyncio.create_task(sts_receiver(sts_ws, ws, streamsid_q, call_sid, ready_evt))
+
+            BUFFER = 160  # 20 ms @ 8k μ-law
+            inbuf = bytearray()
+
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     data = json.loads(msg.data)
@@ -119,28 +129,35 @@ async def twilio_ws_handler(request: web.Request):
                             logging.info("Twilio stream started: %s", streamsid)
                     elif ev == "media":
                         payload = base64.b64decode(data["media"]["payload"])
-                        audio_q.put_nowait(payload)
+                        inbuf.extend(payload)
+                        while len(inbuf) >= BUFFER:
+                            frame = inbuf[:BUFFER]
+                            del inbuf[:BUFFER]
+                            audio_q.put_nowait(frame)
                     elif ev == "stop":
                         logging.info("Twilio stream stopped")
                         break
                 elif msg.type == WSMsgType.ERROR:
-                    logging.error("ws connection closed with exception %s", ws.exception())
+                    logging.error("Twilio ws error: %s", ws.exception())
+
             t1.cancel(); t2.cancel()
     except Exception:
         logging.exception("twilio_ws_handler failure")
 
     return ws
 
+# ==================== HTTP Endpoints ====================
 
-# ============== HTTP API Endpoints ==============
 async def root(_): return web.Response(text="AI Voice Sales Agent OK")
 
 async def twiml(request: web.Request):
+    # Twilio fetches this at call start
+    host = request.host
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice" language="en-AU">This call may be monitored or recorded.</Say>
   <Connect>
-    <Stream url="wss://{request.host}/twilio"/>
+    <Stream url="wss://{host}/twilio"/>
   </Connect>
 </Response>"""
     return web.Response(text=xml, content_type="text/xml")
@@ -189,14 +206,14 @@ async def transcript(request: web.Request):
         return web.json_response({"error":"no transcript"}, status=404)
     return web.FileResponse(path)
 
+# ==================== Entrypoint ====================
 
-# ============== Entrypoint ==============
 def make_app():
     app = web.Application()
     app.router.add_get("/", root)
     app.router.add_get("/twiml", twiml)
-    app.router.add_post("/twiml", twiml)  # Twilio POSTs
-    app.router.add_get("/twilio", twilio_ws_handler)  # Twilio WS upgrades here
+    app.router.add_post("/twiml", twiml)
+    app.router.add_get("/twilio", twilio_ws_handler)  # WS upgrades here
     app.router.add_post("/book_appointment", book_appointment)
     app.router.add_post("/webhooks/recording", recording_webhook)
     app.router.add_get("/transcript", transcript)
@@ -204,6 +221,7 @@ def make_app():
 
 if __name__ == "__main__":
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
+
 
 
 
