@@ -24,8 +24,8 @@ logging.basicConfig(
 RUN_MODE = os.getenv("RUN_MODE", "http")  # "http", "ws", or "both" (both = local dev only)
 PORT = int(os.getenv("PORT", "8080"))     # Render injects this automatically
 
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://your-api.onrender.com")
-PUBLIC_WS_URL   = os.getenv("PUBLIC_WS_URL",   "wss://your-ws.onrender.com/twilio")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+PUBLIC_WS_URL   = os.getenv("PUBLIC_WS_URL")
 
 # Fixed AEST for the assignment (in prod use zoneinfo("Australia/Melbourne"))
 AEST_TZ = dt.timezone(dt.timedelta(hours=10))
@@ -330,5 +330,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pas
+
 
 
