@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import re
+from typing import Optional
 
 from aiohttp import web, WSMsgType
 import websockets
@@ -22,9 +23,9 @@ PORT = int(os.getenv("PORT", "10000"))  # Render injects this automatically
 
 # Storage
 TRANSCRIPTS_DIR = pathlib.Path("transcripts"); TRANSCRIPTS_DIR.mkdir(exist_ok=True)
-CALL_META = {}
+CALL_META: dict[str, dict] = {}
 
-# Booking rule helpers
+# Booking rules
 SLOT_RX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
 ALLOWED_HOURS = {10, 13, 16}
 SAT_ALLOWED = {10, 12}
@@ -34,7 +35,7 @@ def slot_ok(d: dt.datetime) -> bool:
     wd = d.weekday()
     return (wd <= 4 and d.hour in ALLOWED_HOURS) or (wd == 5 and d.hour in SAT_ALLOWED)
 
-def append_transcript(call_sid: str, line: str):
+def append_transcript(call_sid: Optional[str], line: str):
     if not call_sid or not line:
         return
     with (TRANSCRIPTS_DIR / f"{call_sid}.txt").open("a", encoding="utf-8") as f:
@@ -44,26 +45,47 @@ def load_config():
     with open("config.json", "r") as f:
         return json.load(f)
 
+# -------- μ-law (G.711) -> PCM16 conversion --------
+# 20ms from Twilio = 160 μ-law bytes -> 160 linear16 samples -> 320 output bytes
+def mulaw_to_pcm16(mulaw: bytes) -> bytes:
+    out = bytearray(len(mulaw) * 2)
+    j = 0
+    for b in mulaw:
+        u = ~b & 0xFF
+        sign = u & 0x80
+        exponent = (u >> 4) & 0x07
+        mantissa = u & 0x0F
+        # Bias = 132 (0x84). Formula from ITU G.711 μ-law
+        sample = ((mantissa << 3) + 0x84) << exponent
+        sample -= 0x84
+        if sign:
+            sample = -sample
+        # clamp to 16-bit
+        if sample > 32767: sample = 32767
+        if sample < -32768: sample = -32768
+        # little-endian write
+        out[j] = sample & 0xFF
+        out[j+1] = (sample >> 8) & 0xFF
+        j += 2
+    return bytes(out)
+
 # ==================== Twilio <-> Deepgram bridge ====================
 
 async def handle_text_message(decoded, call_sid=None):
-    # Save any agent text/conversation text to transcript
     txt = decoded.get("text") or decoded.get("content")
     if txt and call_sid:
         append_transcript(call_sid, txt)
 
 async def dg_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_sid: str, ready_evt: asyncio.Event):
     """
-    Receives Deepgram events & TTS. Do NOT block on streamSid here.
-    We read immediately; when streamSid arrives (from Twilio 'start'),
-    we pick it up and begin relaying TTS.
+    Receive Deepgram control + TTS. Don't block on streamSid; start reading immediately.
     """
     streamsid = None
     first_jsons_to_log = 5
 
     async for message in sts_ws:
         try:
-            # Keep streamSid up to date without blocking the receiver
+            # pick up streamSid as soon as Twilio provides it
             if streamsid is None and not streamsid_queue.empty():
                 streamsid = await streamsid_queue.get()
 
@@ -77,7 +99,7 @@ async def dg_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_si
                 await handle_text_message(decoded, call_sid)
                 continue
 
-            # Binary TTS from Deepgram -> Twilio (only once we have a streamSid)
+            # Binary TTS from Deepgram -> Twilio (requires streamSid)
             if streamsid:
                 payload = base64.b64encode(message).decode("ascii")
                 await twilio_ws.send_json({
@@ -91,12 +113,10 @@ async def dg_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_si
 
 async def twilio_ws_handler(request: web.Request):
     """
-    Twilio connects here. We bridge Twilio <-> Deepgram Agent.
-
-    Deepgram Agent expects audio as JSON client messages:
-      - {"type":"input_audio_buffer.append","audio":"<base64>"}
+    Twilio connects here. We bridge Twilio <-> Deepgram Agent using JSON audio messages:
+      - {"type":"input_audio_buffer.append","audio":"<base64 PCM16>"}
       - {"type":"input_audio_buffer.commit"}
-      - {"type":"input_audio_buffer.flush"} (at end)
+      - {"type":"input_audio_buffer.flush"} at end
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -105,8 +125,7 @@ async def twilio_ws_handler(request: web.Request):
     streamsid_q = asyncio.Queue()
     ready_evt = asyncio.Event()
 
-    # Buffer + commit timer
-    COMMIT_INTERVAL_MS = 100  # commit roughly every 100ms
+    COMMIT_INTERVAL_MS = 100
     last_commit_ms = 0
 
     try:
@@ -116,19 +135,19 @@ async def twilio_ws_handler(request: web.Request):
         ) as sts_ws:
             logging.info("Connected to Deepgram Agent WS")
             cfg = load_config()
-            await sts_ws.send(json.dumps(cfg))  # Settings first
+            await sts_ws.send(json.dumps(cfg))  # send Settings first
             logging.info("[DG→] config sent")
 
-            # Start receiver immediately (don't wait for streamSid)
+            # start receiver immediately
             dg_recv_task = asyncio.create_task(dg_receiver(sts_ws, ws, streamsid_q, call_sid, ready_evt))
 
-            # Wait for any JSON from DG (Welcome/Started) before sending audio
+            # wait for any DG JSON (Welcome/Started) to gate audio
             await ready_evt.wait()
-            logging.info("Deepgram ready: will forward audio as input_audio_buffer.append")
+            logging.info("Deepgram ready: will forward audio as input_audio_buffer.append (PCM16)")
 
             # Twilio media loop
-            inbuf = bytearray()
-            FRAME = 160  # 20 ms @ 8kHz μ-law
+            ulaw_buf = bytearray()
+            UL_FRAME = 160  # bytes (20 ms @ 8kHz μ-law)
 
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -138,31 +157,30 @@ async def twilio_ws_handler(request: web.Request):
                     if ev == "start":
                         streamsid = data.get("start", {}).get("streamSid")
                         if streamsid:
-                            # make available to the receiver without blocking it
                             await streamsid_q.put(streamsid)
                             logging.info("Twilio stream started: %s", streamsid)
 
                     elif ev == "media":
+                        # accumulate μ-law bytes to 20ms
                         payload = base64.b64decode(data["media"]["payload"])
-                        inbuf.extend(payload)
-                        while len(inbuf) >= FRAME:
-                            frame = inbuf[:FRAME]
-                            del inbuf[:FRAME]
-                            # Send JSON 'append' with base64
+                        ulaw_buf.extend(payload)
+                        while len(ulaw_buf) >= UL_FRAME:
+                            ulaw_frame = bytes(ulaw_buf[:UL_FRAME])
+                            del ulaw_buf[:UL_FRAME]
+                            pcm16 = mulaw_to_pcm16(ulaw_frame)
+                            # send JSON append with base64 PCM16
                             await sts_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(frame).decode("ascii"),
+                                "audio": base64.b64encode(pcm16).decode("ascii"),
                             }))
-
-                            # Time-based commit for low latency
-                            now_ms = int(dt.datetime.utcnow().timestamp() * 1000)
+                            # periodic commit for low latency
+                            now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
                             if now_ms - last_commit_ms >= COMMIT_INTERVAL_MS:
                                 await sts_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                                 last_commit_ms = now_ms
 
                     elif ev == "stop":
                         logging.info("Twilio stream stopped")
-                        # Flush remaining audio to make sure DG processes it
                         try:
                             await sts_ws.send(json.dumps({"type": "input_audio_buffer.flush"}))
                         except Exception:
@@ -253,6 +271,8 @@ def make_app():
 
 if __name__ == "__main__":
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
+
+
 
 
 
