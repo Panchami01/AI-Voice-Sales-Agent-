@@ -1,17 +1,18 @@
 {
   "type": "Settings",
-  "audio": {
-    "input": {
-      "encoding": "mulaw",
-      "sample_rate": 8000,
-      "channels": 1
-    },
-    "output": {
-      "encoding": "mulaw",
-      "sample_rate": 8000,
-      "channels": 1,
-      "container": "none"
-    }
+"audio": {
+  "input": {
+    "encoding": "mulaw",
+    "sample_rate": 8000,
+    "channels": 1,
+    "container": "none"
+  },
+  "output": {
+    "encoding": "mulaw",
+    "sample_rate": 8000,
+    "channels": 1,
+    "container": "none"
+  }
   },
   "agent": {
     "language": "en",
@@ -39,6 +40,7 @@
     "greeting": "Hello! How can I help you today?"
   }
 }
+
 
 
 
