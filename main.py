@@ -41,10 +41,14 @@ else:
 
 # In-memory transcript lines and per-call state keyed by streamSid
 TRANSCRIPTS = defaultdict(list)   # {streamSid: ["[who] text", ...]}
-CALL_STATE  = {}                  # {streamSid: {"caller_cli":..., "qualification":{}, "booking":{}, "compliance_flags":[], "summary":""}}
+CALL_STATE  = {}                  # {streamSid: {...}}
 
 def _append_transcript(streamsid: str, who: str, text: str):
     if streamsid and text:
+        # track unsubscribe intent for compliance
+        if who.lower().startswith("user") or who.lower().startswith("caller"):
+            if " stop" in f" {text.lower()} " or text.strip().upper() == "STOP":
+                CALL_STATE.setdefault(streamsid, {}).setdefault("compliance_flags", []).append("unsubscribe")
         TRANSCRIPTS[streamsid].append(f"[{who}] {text}")
 
 def _transcript_url(streamsid: str) -> str:
@@ -68,6 +72,10 @@ def _send_sms(to_number: str, body: str):
     if not to_number:
         logging.info("SMS skipped: no destination number.")
         return
+    # suppress if caller unsubscribed
+    st = CALL_STATE.get(_sid_from_number(to_number), None)  # best-effort; harmless if None
+    # (We also check compliance flags at send-time below using call state.)
+
     if not twilio_client:
         logging.info("SMS not sent (Twilio not configured). Would send to %s: %s", to_number, body)
         return
@@ -76,6 +84,9 @@ def _send_sms(to_number: str, body: str):
         logging.info("SMS sent to %s", to_number)
     except Exception:
         logging.exception("Failed to send SMS")
+
+def _sid_from_number(_):  # helper kept for potential future mapping
+    return None
 
 # -------------------- Deepgram connection --------------------
 def sts_connect():
@@ -197,14 +208,22 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
             event = data.get("event")
 
             if event == "start":
-                streamsid = data.get("start", {}).get("streamSid")
+                start = data.get("start", {})
+                streamsid = start.get("streamSid")
                 if streamsid:
                     current_sid = streamsid
                     streamsid_queue.put_nowait(streamsid)
+                    # pull custom params (customer_phone, optional recording_url)
+                    custom = (start.get("customParameters") or {}) if isinstance(start.get("customParameters"), dict) else {}
+                    caller_cli = custom.get("customer_phone") or start.get("from")
+                    recording_url = custom.get("recording_url")
+                    call_sid = start.get("callSid")
+
                     # seed per-call state
                     CALL_STATE[streamsid] = {
-                        "caller_cli": (data.get("start", {}).get("customParameters") or {}).get("customer_phone")
-                                      or data.get("start", {}).get("from"),
+                        "caller_cli": caller_cli,
+                        "call_sid": call_sid,
+                        "recording_url": recording_url,  # may be None; fine
                         "qualification": {},
                         "booking": {},
                         "compliance_flags": [],
@@ -234,15 +253,20 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
 
                     # Build call log payload
                     state = CALL_STATE.get(current_sid, {})
+                    # Prefer local timezone (+10/+11) for human-reads in logs:
+                    ts = datetime.now(timezone.utc).astimezone().isoformat()
+
                     payload = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "timestamp": ts,
                         "caller_cli": state.get("caller_cli"),
                         "summary": state.get("summary", ""),
                         "qualification": state.get("qualification", {}),
                         "booking": state.get("booking", {}),
                         "compliance_flags": state.get("compliance_flags", []),
                         "transcript_url": transcript_link,
-                        "recording_url": None
+                        "recording_url": state.get("recording_url"),
+                        "call_sid": state.get("call_sid"),
+                        "stream_sid": current_sid
                     }
 
                     # 1) Print transcript link
@@ -252,35 +276,36 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
                     logging.info("CALL_LOG %s", json.dumps(payload, ensure_ascii=False))
                     _post_log_if_configured(payload)
 
-                    # 3) If booking exists, emit appointment JSON AND SMS it
+                    # 3) SMS (booking + transcript) unless unsubscribed
                     booking = state.get("booking", {})
                     customer_phone = state.get("caller_cli")
-                    if booking.get("booking_id"):
-                        booking_out = {
-                            "type": "appointment",
-                            "streamSid": current_sid,
-                            "booking": booking,
-                            "transcript_url": transcript_link
-                        }
-                        logging.info("APPOINTMENT %s", json.dumps(booking_out, ensure_ascii=False))
-                        _post_log_if_configured(booking_out)
+                    unsubscribed = "unsubscribe" in (state.get("compliance_flags") or [])
+                    if not unsubscribed and customer_phone:
+                        if booking.get("booking_id"):
+                            booking_out = {
+                                "type": "appointment",
+                                "streamSid": current_sid,
+                                "booking": booking,
+                                "transcript_url": transcript_link
+                            }
+                            logging.info("APPOINTMENT %s", json.dumps(booking_out, ensure_ascii=False))
+                            _post_log_if_configured(booking_out)
 
-                        # Compose SMS with appointment + transcript
-                        sms_lines = []
-                        if booking.get("message"):
-                            sms_lines.append(booking["message"])
+                            # Compose SMS with appointment + transcript
+                            sms_lines = []
+                            if booking.get("message"):
+                                sms_lines.append(booking["message"])
+                            else:
+                                sms_lines.append(
+                                    f"Your Riverstone Place appointment is booked. Ref {booking.get('booking_id')} at {booking.get('slot_iso')} (AEST)."
+                                )
+                            if transcript_link:
+                                sms_lines.append(f"Transcript: {transcript_link}")
+                            _send_sms(customer_phone, "\n".join(sms_lines))
                         else:
-                            sms_lines.append(
-                                f"Your Riverstone Place appointment is booked. Ref {booking.get('booking_id')} at {booking.get('slot_iso')} (AEST)."
-                            )
-                        if transcript_link:
-                            sms_lines.append(f"Transcript: {transcript_link}")
-                        _send_sms(customer_phone, "\n".join(sms_lines))
-
-                    else:
-                        # No booking → still send transcript link so the caller has it
-                        if transcript_link and state.get("caller_cli"):
-                            _send_sms(state["caller_cli"], f"Thanks for calling Riverstone Place. Your transcript: {transcript_link}")
+                            # No booking → still send transcript link so the caller has it
+                            if transcript_link:
+                                _send_sms(customer_phone, f"Thanks for calling Riverstone Place. Your transcript: {transcript_link}")
 
                 break
 
@@ -294,7 +319,7 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
             logging.exception("twilio_receiver crashed")
             break
 
-# -------------------- Health check, transcript serving, upgrade separation --------------------
+# -------------------- Health check & transcript serving --------------------
 async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
     return (status, [("Content-Type", content_type)], body.encode("utf-8"))
 
@@ -363,7 +388,7 @@ async def twilio_handler(twilio_ws, path=None, *args):
 
 # -------------------- Server bootstrap --------------------
 async def main():
-    # Railway provides $PORT automatically; keep 5000 fallback for local
+    # $PORT for Render/Railway; keep 5000 fallback for local
     port = int(os.environ.get("PORT", 5000))
 
     # Twilio requires "audio" subprotocol
@@ -388,6 +413,8 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 
