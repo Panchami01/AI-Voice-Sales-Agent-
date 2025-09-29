@@ -1,82 +1,175 @@
 # Riverstone Place – Voice Sales Agent
 
-This project implements a professional **voice sales agent** for **Riverstone Place**, a fictional apartment development in Abbotsford, VIC (Melbourne, Australia).  
-It was built as part of a take-home test and demonstrates a **Twilio + Deepgram Agent + Python** pipeline with booking, compliance, transcript, and logging features.
+This project implements a professional **voice sales agent** for **Riverstone Place**, a fictional apartment development in Abbotsford, VIC (Melbourne, Australia).
+It demonstrates a **Twilio + Deepgram Agent + Python** pipeline with booking, compliance, transcript, and logging features.
 
 ---
 
 ## ✨ Features
 
-- 📞 **Inbound Calls via Twilio** – caller hears a natural Polly greeting and is connected to an AI sales agent.
-- 🎙 **Low-latency, barge-in conversation** – agent allows interruptions and clarifies when mishearing.
-- 📑 **Qualification workflow** – collects and confirms: name, phone, email, budget, bedrooms, parking, buyer type, move-in timeframe, finance status, preferred suburbs.
-- ❓ **Knowledge-based answers** – agent answers only from the knowledge pack provided, with objection handling and recommendations.
-- 📅 **Booking API** – `/book_appointment` validates allowed AEST time slots and returns spec JSON.
-- 📝 **Transcript storage** – per-call transcript saved and served as plain text at `/transcripts/{CallSid}.txt`.
-- 🎧 **Recording URL** – Twilio recording started at call connect; final `.mp3` link included in the log.
-- 📊 **Logging** – per-call JSON log with timestamp, caller_cli, summary, qualification, booking, compliance flags, transcript & recording URLs at `/logs/latest`.
-- 🛡 **Compliance** – supports STOP/unsubscribe phrases; declines FIRB/financial/tax/rental yield queries and offers referral.
+* 📞 **Inbound Calls via Twilio** – callers are greeted and connected to the AI sales agent.
+* 🎙 **Low-latency, barge-in conversation** – agent allows interruptions and handles mishears naturally.
+* 📑 **Qualification workflow** – collects and confirms: budget, bedrooms, parking, timeframe, owner-occupier vs investor, finance status, suburb (Abbostford only), and contact details.
+* ❓ **Knowledge-based answers** – agent answers only from the Riverstone Place knowledge pack, with objections handled and recommendations given.
+* 📅 **Booking support** – detects booking confirmations and returns structured JSON with slot, mode, and reference ID.
+* 📝 **Transcript storage** – per-call transcript saved and served as plain text at `/transcripts/{StreamSid}.txt`.
+* 🎧 **Recording URL support** – accepts recording link from Twilio custom parameters and includes it in logs.
+* 📊 **Logging** – per-call JSON log with timestamp, caller number, summary, qualification, booking, compliance flags, transcript URL, and recording URL.
+* 🛡 **Compliance** – recognises STOP/unsubscribe phrases; declines FIRB/financial/tax/rental yield queries and offers referral.
 
 ---
 
 ## 🛠 Architecture
 
-The system is split into two lightweight services hosted on Render:
+The system runs as a lightweight Python WebSocket server on Railway:
 
-- **API Service (HTTP, `riverstone-api`)**
-  - `GET /twiml` → Returns TwiML (greeting, start recording, connect to media stream)
-  - `POST /webhooks/recording` → Stores Twilio recording URL
-  - `POST /book_appointment` → Validates AEST slots, returns booking JSON
-  - `GET /logs/latest` → Last call log JSON
-  - `GET /transcripts/{CallSid}.txt` → Transcript per call
+* **Twilio**
 
-- **WS Service (WSS, `riverstone-ws`)**
-  - `wss://.../twilio` → Receives Twilio Media Streams, relays to Deepgram Agent, streams TTS back to Twilio
+  * Handles inbound calls
+  * Streams audio via `<Connect><Stream>` or `<Start><Stream>` to the WS service
+  * Passes caller number as `customer_phone` parameter
 
-- **Deepgram Agent**
-  - Listens (STT), thinks (LLM, GPT-4o-mini), and speaks (TTS, Aura-2 Thalia EN)
-  - Configured for μ-law 8k audio (compatible with Twilio)
-  - Implements sales agent prompt, qualification, objections, booking flow
+* **WS Service (Python)**
 
-- **Twilio**
-  - Handles inbound calls
-  - Plays initial greeting (Polly Nicole)
-  - Streams audio to/from WS Service
-  - Starts/stops recordings, posts RecordingUrl back to API
+  * Endpoint: `wss://<your-app>.up.railway.app/twilio`
+  * Bridges Twilio audio ⇄ Deepgram Agent
+  * Manages per-call state: transcript, booking, compliance
+  * On call end: logs JSON, saves transcript, sends SMS (if configured)
 
-### Flow
+* **Deepgram Agent**
 
-1. Caller dials Twilio number.  
-2. Twilio requests `/twiml` from API service.  
-3. TwiML:
-   - Greets caller
-   - Starts recording → `/webhooks/recording`
-   - Connects call to `wss://riverstone-ws.onrender.com/twilio`  
-4. WS service bridges Twilio audio ⇄ Deepgram Agent in real time.  
-5. Agent:
-   - Collects qualification info
-   - Answers questions from knowledge pack
-   - Calls `/book_appointment` when user selects slot  
-6. API service exposes:
-   - Transcript at `/transcripts/{CallSid}.txt`
-   - Recording URL (from Twilio)
-   - JSON log at `/logs/latest`  
+  * STT: `nova-3`
+  * LLM: `gpt-4o-mini`
+  * TTS: `aura-2-thalia-en`
+  * Configured with prompt + knowledge pack for Riverstone Place
 
+* **Optional APIs**
 
+  * `/health` → Health check
+  * `/transcripts/{StreamSid}.txt` → Transcript per call
 
-## ⚙️ Tech Stack
+### Call Flow
 
-- **Telephony:** [Twilio Media Streams](https://www.twilio.com/docs/voice/twiml/stream)  
-- **STT/TTS/Dialog:** [Deepgram Agent Converse](https://developers.deepgram.com) (Nova-3, Aura-2 Thalia EN)  
-- **Runtime:** Python 3.12, `websockets`, `aiohttp`, `python-dotenv`  
-- **Hosting:** [Render](https://render.com) – two services:  
-  - `riverstone-api` → HTTP endpoints  
-  - `riverstone-ws` → WSS media stream endpoint  
+1. Caller dials Twilio number.
+2. Twilio TwiML `<Stream>` connects to Railway WS endpoint with `customer_phone`.
+3. Server bridges audio with Deepgram Agent.
+4. Agent:
+
+   * Greets caller, collects qualification info
+   * Answers questions from knowledge pack
+   * Offers booking → tool response triggers booking log + SMS
+5. On call end, server:
+
+   * Finalises transcript
+   * Logs JSON payload
+   * Posts to webhook (if configured)
+   * Sends SMS with booking confirmation + transcript (or transcript only)
 
 ---
 
-## 📦 Setup (Local)
+## ⚙️ Tech Stack
 
-1. Clone repo & install deps:
-   ```bash
-   pip install -r requirements.txt
+* **Telephony:** [Twilio Media Streams](https://www.twilio.com/docs/voice/twiml/stream)
+* **STT/TTS/Dialog:** [Deepgram Agent Converse](https://developers.deepgram.com)
+* **Runtime:** Python 3.10+, `websockets`, `python-dotenv`, `twilio`, `requests`
+* **Hosting:** [Railway](https://railway.app)
+
+---
+
+## 📦 Setup
+
+### Requirements
+
+```
+websockets
+python-dotenv
+twilio
+requests
+```
+
+### Environment Variables
+
+```
+DEEPGRAM_API_KEY=dg_xxx
+PUBLIC_BASE_URL=https://<your-app>.up.railway.app
+LOG_WEBHOOK_URL=https://example.com/logs   # optional
+TWILIO_ACCOUNT_SID=ACxxx
+TWILIO_AUTH_TOKEN=xxx
+TWILIO_SMS_FROM=+61XXXXXXXXX
+```
+
+### Local Run
+
+```bash
+python main.py
+```
+
+Server listens on `0.0.0.0:$PORT` (default 5000).
+
+### Railway Deploy
+
+`railway.json`:
+
+```json
+{
+  "build": { "builder": "NIXPACKS" },
+  "deploy": { "startCommand": "python main.py" }
+}
+```
+
+Steps:
+
+1. Connect repo to Railway.
+2. Add environment variables.
+3. Deploy → copy public URL for Twilio.
+
+---
+
+## ☎️ Twilio Setup
+
+TwiML Bin (Option A):
+
+```xml
+<Response>
+  <Connect>
+    <Stream url="wss://<YOUR_PUBLIC_HOST>/twilio" track="both_tracks">
+      <Parameter name="customer_phone" value="{{From}}"/>
+    </Stream>
+  </Connect>
+</Response>
+```
+
+Expected server log:
+
+```
+WS connected path=/twilio negotiated_subprotocol=audio
+```
+
+---
+
+## ✅ Testing Checklist
+
+1. Call Twilio number.
+2. Logs show `negotiated_subprotocol=audio`.
+3. Talk → hang up.
+4. Check logs for `TRANSCRIPT_URL` and `CALL_LOG`.
+5. Open transcript URL → transcript visible.
+6. If Twilio vars set → SMS received with transcript (and booking info if booked).
+
+---
+
+## 🔧 Troubleshooting
+
+* **Stream stops immediately:** TwiML misconfigured; ensure `<Stream>` URL uses `wss://<your-app>/twilio`.
+* **No SMS:** Check Twilio vars and confirm number is in E.164 (`+61…`). See Twilio Messaging Logs.
+* **Transcript 404:** Call didn’t reach `stop` event; check streamSid.
+* **Booking not detected:** Ensure agent calls `book_appointment` tool.
+
+---
+
+## 🔒 Compliance & Security
+
+* STOP/unsubscribe suppresses SMS.
+* No financial/tax/FIRB advice given.
+* Transcript URLs are public if base URL is set; restrict if needed.
+
