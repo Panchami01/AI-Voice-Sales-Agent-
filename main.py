@@ -132,13 +132,14 @@ async def twilio_handler(twilio_ws, path=None, *args):
             pass
 
 async def main():
-    # Stick to 5000 and tunnel it with: ngrok http 5000
-    server = await websockets.serve(twilio_handler, host="0.0.0.0", port=5000)
-    logging.info("Started server on 0.0.0.0:5000 (run: ngrok http 5000)")
+    port = int(os.getenv("PORT", "5000"))  # fallback to 5000 for local dev
+    server = await websockets.serve(twilio_handler, host="0.0.0.0", port=port)
+    logging.info(f"Started server on 0.0.0.0:{port}")
     await server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
