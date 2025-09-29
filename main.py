@@ -3,6 +3,8 @@ import base64
 import json
 import logging
 import os
+from urllib.parse import urlparse
+
 import websockets
 from dotenv import load_dotenv
 
@@ -14,7 +16,7 @@ def sts_connect():
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPGRAM_API_KEY not found")
-    # Fixed URL + required subprotocols for Deepgram Agent
+    # Deepgram Agent expects subprotocols ["token", <API_KEY>]
     return websockets.connect(
         "wss://agent.deepgram.com/v1/agent/converse",
         subprotocols=["token", api_key],
@@ -34,7 +36,7 @@ async def handle_barge_in(decoded, twilio_ws, streamsid):
 
 async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
     await handle_barge_in(decoded, twilio_ws, streamsid)
-    # TODO: function calling if needed
+    # place function-calling or message handling here if needed
 
 async def sts_sender(sts_ws, audio_queue: asyncio.Queue):
     logging.info("sts_sender started")
@@ -55,7 +57,7 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue):
                 decoded = json.loads(message)
                 await handle_text_message(decoded, twilio_ws, sts_ws, streamsid)
                 continue
-            # Binary assumed to be mulaw @ 8k (per your config)
+            # Binary presumed to be mulaw @ 8k (per your config)
             raw_mulaw = message
             media_message = {
                 "event": "media",
@@ -68,7 +70,7 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue):
             break
 
 async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streamsid_queue: asyncio.Queue):
-    BUFFER_SIZE = 20 * 160  # 20ms of 8k mulaw (160 bytes)
+    BUFFER_SIZE = 20 * 160  # 20ms frames @ 8k mulaw (160 bytes)
     inbuffer = bytearray()
     async for message in twilio_ws:
         try:
@@ -90,7 +92,7 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
                 if not b64:
                     continue
                 chunk = base64.b64decode(b64)
-                # Twilio may send track as "inbound" or "inbound_audio"
+                # Twilio track may be "inbound" or "inbound_audio"
                 if media.get("track") in ("inbound", "inbound_audio"):
                     inbuffer.extend(chunk)
 
@@ -111,19 +113,27 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
 async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
     return (status, [("Content-Type", content_type)], body.encode("utf-8"))
 
-# Only serve /health to plain-HTTP; let WS upgrades pass through
+# Only serve /health to plain-HTTP; let WS upgrades proceed untouched
 async def process_request(path, request_headers):
     upgrade = request_headers.get("Upgrade", "").lower()
     if upgrade == "websocket":
-        logging.info("WS upgrade attempt path=%s subprotocols=%s",
-                     path, request_headers.get("Sec-WebSocket-Protocol"))
+        logging.info(
+            "WS upgrade attempt path=%s subprotocols=%s",
+            path,
+            request_headers.get("Sec-WebSocket-Protocol"),
+        )
         return None  # proceed with WS handshake
     if path == "/health":
         return await _http_response(200, "OK")
     return await _http_response(404, "Not Found")
 
-# Restrict which WS paths are accepted (keeps noise & mistakes out)
+# Allowed *path components* (ignore querystrings)
 ALLOWED_WS_PATHS = {"/twilio", "/ws", "/"}
+
+def _is_allowed_ws_path(request_path: str) -> bool:
+    # urlparse to strip querystrings like /twilio?foo=bar
+    pure_path = urlparse(request_path).path or "/"
+    return pure_path in ALLOWED_WS_PATHS
 
 # ✅ Handler compatible with both (websocket) and (websocket, path)
 async def twilio_handler(twilio_ws, path=None, *args):
@@ -131,7 +141,7 @@ async def twilio_handler(twilio_ws, path=None, *args):
         # Newer websockets passes only (websocket); path is on the object
         path = getattr(twilio_ws, "path", "/")
 
-    if path not in ALLOWED_WS_PATHS:
+    if not _is_allowed_ws_path(path):
         logging.warning("Rejecting unexpected WS path: %s", path)
         try:
             await twilio_ws.close(code=1008, reason="Invalid path")
@@ -160,22 +170,22 @@ async def twilio_handler(twilio_ws, path=None, *args):
 
 # -------------------- Server bootstrap (Render-ready) --------------------
 async def main():
-    # Render assigns a dynamic port via $PORT (falls back to 5000 for local dev)
     port = int(os.environ.get("PORT", 5000))
 
-    # Subprotocols: Twilio requires "audio"; others might offer "json"/"deepgram"
-    advertised_subprotocols = ["audio", "json", "twilio", "deepgram"]
+    # Subprotocols: Twilio requires "audio".
+    # Keep the list minimal to guarantee selection when offered.
+    advertised_subprotocols = ["audio"]
 
-    # Keepalive pings so idle connections don't get dropped by the PaaS
-    ping_interval = 20  # seconds between pings
-    ping_timeout = 20   # seconds to wait for pong
+    # Keepalive pings to avoid idle disconnects on PaaS
+    ping_interval = 20  # seconds
+    ping_timeout = 20   # seconds
 
     server = await websockets.serve(
         twilio_handler,
         host="0.0.0.0",
         port=port,
         process_request=process_request,      # /health for HTTP; None for upgrades
-        subprotocols=advertised_subprotocols, # negotiate Twilio/others cleanly
+        subprotocols=advertised_subprotocols, # negotiate Twilio cleanly
         max_size=8 * 1024 * 1024,
         ping_interval=ping_interval,
         ping_timeout=ping_timeout,
@@ -185,6 +195,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
