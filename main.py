@@ -131,6 +131,19 @@ async def twilio_handler(twilio_ws, path=None, *args):
         except Exception:
             pass
 
+
+# Add this helper anywhere above main()
+async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
+    return (status, [("Content-Type", content_type)], body.encode("utf-8"))
+
+# Minimal HTTP health-check for Render
+async def health_check(path, request_headers):
+    # Return 200 OK for "/" so Render’s health check passes
+    if path == "/":
+        return await _http_response(200, "OK")
+    # Let websockets proceed for upgrades; any other plain-HTTP path gets 404
+    return await _http_response(404, "Not Found")
+
 async def main():
     port = int(os.getenv("PORT", "5000"))  # fallback to 5000 for local dev
     server = await websockets.serve(twilio_handler, host="0.0.0.0", port=port)
@@ -139,6 +152,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
