@@ -155,12 +155,21 @@ ALLOWED_WS_PATHS = {"/", "/twilio", "/ws"}  # include the one your client actual
 
 async def main():
     port = int(os.getenv("PORT", "5000"))  # fallback to 5000 for local dev
-    server = await websockets.serve(twilio_handler, host="0.0.0.0", port=port)
+    common_subprotocols = ["audio", "json", "twilio", "deepgram"]
+    server = await websockets.serve(
+        twilio_handler,
+        host="0.0.0.0",
+        port=port,
+        process_request=process_request,  # /health for HTTP, None for upgrades
+        subprotocols=common_subprotocols, # negotiate Twilio/others cleanly
+        max_size=8 * 1024 * 1024          # optional: raise if you stream big frames
+    )
     logging.info(f"Started server on 0.0.0.0:{port}")
     await server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
