@@ -1,247 +1,144 @@
 import asyncio
 import base64
-import datetime as dt
 import json
 import logging
 import os
-import pathlib
-import re
-
-from aiohttp import web, WSMsgType
 import websockets
 from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-if not DEEPGRAM_API_KEY:
-    raise RuntimeError("Missing DEEPGRAM_API_KEY")
-
-PORT = int(os.getenv("PORT", "10000"))  # Render injects this automatically
-
-# Storage
-TRANSCRIPTS_DIR = pathlib.Path("transcripts"); TRANSCRIPTS_DIR.mkdir(exist_ok=True)
-CALL_META = {}
-
-# Booking rule helpers
-SLOT_RX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
-ALLOWED_HOURS = {10, 13, 16}
-SAT_ALLOWED = {10, 12}
-AEST_TZ = dt.timezone(dt.timedelta(hours=10))
-
-def slot_ok(d: dt.datetime) -> bool:
-    wd = d.weekday()
-    return (wd <= 4 and d.hour in ALLOWED_HOURS) or (wd == 5 and d.hour in SAT_ALLOWED)
-
-def append_transcript(call_sid: str, line: str):
-    if not call_sid or not line:
-        return
-    with (TRANSCRIPTS_DIR / f"{call_sid}.txt").open("a", encoding="utf-8") as f:
-        f.write(line.rstrip() + "\n")
+def sts_connect():
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPGRAM_API_KEY not found")
+    # Fixed URL
+    return websockets.connect(
+        "wss://agent.deepgram.com/v1/agent/converse",
+        subprotocols=["token", api_key],
+    )
 
 def load_config():
     with open("config.json", "r") as f:
         return json.load(f)
 
-# ==================== Twilio <-> Deepgram bridge ====================
+async def handle_barge_in(decoded, twilio_ws, streamsid):
+    try:
+        if decoded.get("type") == "UserStartedSpeaking":
+            await twilio_ws.send(json.dumps({"event": "clear", "streamSid": streamsid}))
+    except Exception:
+        logging.exception("handle_barge_in failed")
 
-async def handle_text_message(decoded, call_sid=None):
-    # Save any agent text/conversation text to transcript
-    txt = decoded.get("text") or decoded.get("content")
-    if txt and call_sid:
-        append_transcript(call_sid, txt)
+async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
+    await handle_barge_in(decoded, twilio_ws, streamsid)
+    # TODO: function calling if needed
 
-async def dg_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue, call_sid: str, ready_evt: asyncio.Event):
-    """Receives Deepgram events and TTS audio; relays audio back to Twilio."""
-    streamsid = await streamsid_queue.get()
-    first_jsons_to_log = 5
+async def sts_sender(sts_ws, audio_queue: asyncio.Queue):
+    logging.info("sts_sender started")
+    while True:
+        chunk = await audio_queue.get()
+        try:
+            await sts_ws.send(chunk)
+        except Exception:
+            logging.exception("sts_sender send failed")
+            break
+
+async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue):
+    logging.info("sts_receiver started")
+    streamsid = await streamsid_queue.get()  # wait for Twilio streamSid
     async for message in sts_ws:
         try:
             if isinstance(message, str):
                 decoded = json.loads(message)
-                if first_jsons_to_log > 0:
-                    logging.info("[DG←] %s", json.dumps(decoded)[:800])
-                    first_jsons_to_log -= 1
-                if not ready_evt.is_set():
-                    ready_evt.set()
-                await handle_text_message(decoded, call_sid)
+                await handle_text_message(decoded, twilio_ws, sts_ws, streamsid)
                 continue
-            # Binary TTS from Deepgram -> Twilio
-            payload = base64.b64encode(message).decode("ascii")
-            await twilio_ws.send_json({
+            # Binary assumed to be mulaw @ 8k (per your config)
+            raw_mulaw = message
+            media_message = {
                 "event": "media",
                 "streamSid": streamsid,
-                "media": {"payload": payload},
-            })
+                "media": {"payload": base64.b64encode(raw_mulaw).decode("ascii")},
+            }
+            await twilio_ws.send(json.dumps(media_message))
         except Exception:
-            logging.exception("dg_receiver failed")
+            logging.exception("sts_receiver failed")
             break
 
-async def twilio_ws_handler(request: web.Request):
-    """
-    Twilio connects here. We bridge Twilio <-> Deepgram Agent.
+async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streamsid_queue: asyncio.Queue):
+    BUFFER_SIZE = 20 * 160  # 20ms of 8k mulaw (160 bytes)
+    inbuffer = bytearray()
+    async for message in twilio_ws:
+        try:
+            data = json.loads(message)
+            event = data.get("event")
 
-    IMPORTANT: Deepgram Agent expects audio as JSON client messages:
-      - {"type":"input_audio_buffer.append","audio":"<base64>"}
-      - {"type":"input_audio_buffer.commit"}
-      - {"type":"input_audio_buffer.flush"} (at end)
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
+            if event == "start":
+                streamsid = data.get("start", {}).get("streamSid")
+                if streamsid:
+                    streamsid_queue.put_nowait(streamsid)
+                logging.info("Twilio stream started: %s", streamsid)
 
-    call_sid = request.query.get("CallSid")
-    streamsid_q = asyncio.Queue()
-    ready_evt = asyncio.Event()
+            elif event == "connected":
+                continue
 
-    # Buffer + commit timer
-    COMMIT_INTERVAL_MS = 100  # commit roughly every 100ms of audio appended
-    last_commit = 0
+            elif event == "media":
+                media = data.get("media", {})
+                b64 = media.get("payload")
+                if not b64:
+                    continue
+                chunk = base64.b64decode(b64)
+                # Twilio may send track as "inbound" or "inbound_audio"
+                if media.get("track") in ("inbound", "inbound_audio"):
+                    inbuffer.extend(chunk)
+
+            elif event == "stop":
+                logging.info("Twilio stream stopped")
+                break
+
+            while len(inbuffer) >= BUFFER_SIZE:
+                frame = inbuffer[:BUFFER_SIZE]
+                audio_queue.put_nowait(frame)
+                del inbuffer[:BUFFER_SIZE]
+
+        except Exception:
+            logging.exception("twilio_receiver crashed")
+            break
+
+# ✅ Handler compatible with both (websocket) and (websocket, path)
+async def twilio_handler(twilio_ws, path=None, *args):
+    if path is None:
+        # Newer websockets passes only (websocket); path is on the object
+        path = getattr(twilio_ws, "path", "/")
+    if path != "/twilio":
+        logging.warning("Unexpected WS path: %s", path)
+
+    audio_queue = asyncio.Queue()
+    streamsid_queue = asyncio.Queue()
 
     try:
-        async with websockets.connect(
-            "wss://agent.deepgram.com/v1/agent/converse",
-            subprotocols=["token", DEEPGRAM_API_KEY],
-        ) as sts_ws:
-            logging.info("Connected to Deepgram Agent WS")
-            cfg = load_config()
-            await sts_ws.send(json.dumps(cfg))  # Settings first (required). :contentReference[oaicite:0]{index=0}
-            logging.info("[DG→] config sent")
-
-            # Start receiver
-            dg_recv_task = asyncio.create_task(dg_receiver(sts_ws, ws, streamsid_q, call_sid, ready_evt))
-
-            # We only start appending audio after Deepgram ack's something
-            await ready_evt.wait()
-            logging.info("Deepgram ready: will forward audio as input_audio_buffer.append")
-
-            # Twilio media loop
-            inbuf = bytearray()
-            FRAME = 160  # 20ms @ 8kHz μ-law
-
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    ev = data.get("event")
-
-                    if ev == "start":
-                        streamsid = data.get("start", {}).get("streamSid")
-                        if streamsid:
-                            streamsid_q.put_nowait(streamsid)
-                            logging.info("Twilio stream started: %s", streamsid)
-
-                    elif ev == "media":
-                        # accumulate to exact 20ms frames
-                        payload = base64.b64decode(data["media"]["payload"])
-                        inbuf.extend(payload)
-                        while len(inbuf) >= FRAME:
-                            frame = inbuf[:FRAME]
-                            del inbuf[:FRAME]
-                            # Send JSON "append" with base64
-                            await sts_ws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(frame).decode("ascii"),
-                            }))  # Deepgram expects audio as JSON client messages, not raw binary. :contentReference[oaicite:1]{index=1}
-
-                            # Time-based commits help reduce latency
-                            now_ms = int(dt.datetime.utcnow().timestamp() * 1000)
-                            if now_ms - last_commit >= COMMIT_INTERVAL_MS:
-                                await sts_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                                last_commit = now_ms
-
-                    elif ev == "stop":
-                        logging.info("Twilio stream stopped")
-                        # Flush any remaining audio to make Deepgram process it
-                        try:
-                            await sts_ws.send(json.dumps({"type": "input_audio_buffer.flush"}))
-                        except Exception:
-                            pass
-                        break
-
-                elif msg.type == WSMsgType.ERROR:
-                    logging.error("Twilio ws error: %s", ws.exception())
-
-            dg_recv_task.cancel()
-
+        async with sts_connect() as sts_ws:
+            await sts_ws.send(json.dumps(load_config()))
+            t1 = asyncio.create_task(sts_sender(sts_ws, audio_queue))
+            t2 = asyncio.create_task(sts_receiver(sts_ws, twilio_ws, streamsid_queue))
+            t3 = asyncio.create_task(twilio_receiver(twilio_ws, sts_ws, audio_queue, streamsid_queue))
+            await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_EXCEPTION)
     except Exception:
-        logging.exception("twilio_ws_handler failure")
+        logging.exception("twilio_handler failure")
+    finally:
+        try:
+            await twilio_ws.close()
+        except Exception:
+            pass
 
-    return ws
-
-# ==================== HTTP Endpoints ====================
-
-async def root(_): return web.Response(text="AI Voice Sales Agent OK")
-
-async def twiml(request: web.Request):
-    host = request.host
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice" language="en-AU">This call may be monitored or recorded.</Say>
-  <Connect>
-    <Stream url="wss://{host}/twilio"/>
-  </Connect>
-</Response>"""
-    return web.Response(text=xml, content_type="text/xml")
-
-async def book_appointment(request: web.Request):
-    try:
-        body = await request.json()
-        for k in ("name","phone","email","slot_iso","mode"):
-            if not body.get(k):
-                return web.json_response({"ok":False,"message":f"missing {k}"}, status=400)
-        slot_iso = body["slot_iso"]
-        if not SLOT_RX.match(slot_iso):
-            return web.json_response({"ok":False,"message":"bad slot_iso"}, status=400)
-        d = dt.datetime.fromisoformat(slot_iso)
-        if d <= dt.datetime.now(dt.timezone.utc).astimezone(d.tzinfo):
-            return web.json_response({"ok":False,"message":"slot in past"}, status=400)
-        if not slot_ok(d):
-            return web.json_response({"ok":False,"message":"slot not in allowed windows"}, status=400)
-        booking_id = f"RS-{d.strftime('%Y%m%d-%H%M')}"
-        return web.json_response({
-            "ok": True,
-            "booking_id": booking_id,
-            "status": "confirmed",
-            "slot_iso": slot_iso,
-            "mode": body["mode"]
-        })
-    except Exception as e:
-        logging.exception("book_appointment error")
-        return web.json_response({"ok":False,"message":str(e)}, status=500)
-
-async def recording_webhook(request: web.Request):
-    data = await request.post()
-    call_sid = data.get("CallSid")
-    rec = data.get("RecordingUrl")
-    if call_sid and rec:
-        CALL_META.setdefault(call_sid, {})["recording_url"] = rec + ".mp3"
-        logging.info("Recording saved for %s", call_sid)
-    return web.Response(text="ok")
-
-async def transcript(request: web.Request):
-    call_sid = request.query.get("call_sid")
-    if not call_sid:
-        return web.json_response({"error":"missing call_sid"}, status=400)
-    path = TRANSCRIPTS_DIR / f"{call_sid}.txt"
-    if not path.exists():
-        return web.json_response({"error":"no transcript"}, status=404)
-    return web.FileResponse(path)
-
-# ==================== Entrypoint ====================
-
-def make_app():
-    app = web.Application()
-    app.router.add_get("/", root)
-    app.router.add_get("/twiml", twiml)
-    app.router.add_post("/twiml", twiml)
-    app.router.add_get("/twilio", twilio_ws_handler)  # WS upgrades here
-    app.router.add_post("/book_appointment", book_appointment)
-    app.router.add_post("/webhooks/recording", recording_webhook)
-    app.router.add_get("/transcript", transcript)
-    return app
+async def main():
+    # Stick to 5000 and tunnel it with: ngrok http 5000
+    server = await websockets.serve(twilio_handler, host="0.0.0.0", port=5000)
+    logging.info("Started server on 0.0.0.0:5000 (run: ngrok http 5000)")
+    await server.wait_closed()
 
 if __name__ == "__main__":
-    web.run_app(make_app(), host="0.0.0.0", port=PORT)
+    asyncio.run(main())
 
 
 
