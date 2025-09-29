@@ -3,14 +3,11 @@
   "audio": {
     "input": {
       "encoding": "mulaw",
-      "sample_rate": 8000,
-      "channels": 1,
-      "container": "none"
+      "sample_rate": 8000
     },
     "output": {
       "encoding": "mulaw",
       "sample_rate": 8000,
-      "channels": 1,
       "container": "none"
     }
   },
@@ -20,7 +17,7 @@
       "provider": {
         "type": "deepgram",
         "model": "nova-3",
-        "keyterms": ["hello", "goodbye"]
+        "keyterms": ["hello", "goodbye", "booking", "appointment", "inspection", "yes", "no"]
       }
     },
     "think": {
@@ -40,6 +37,8 @@
     "greeting": "Hello! How can I help you today?"
   }
 }
+
+
 
 
 
