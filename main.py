@@ -9,11 +9,12 @@ from dotenv import load_dotenv
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
+# -------------------- Deepgram connection --------------------
 def sts_connect():
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPGRAM_API_KEY not found")
-    # Fixed URL
+    # Fixed URL + required subprotocols for Deepgram Agent
     return websockets.connect(
         "wss://agent.deepgram.com/v1/agent/converse",
         subprotocols=["token", api_key],
@@ -23,6 +24,7 @@ def load_config():
     with open("config.json", "r") as f:
         return json.load(f)
 
+# -------------------- Twilio <-> Agent helpers --------------------
 async def handle_barge_in(decoded, twilio_ws, streamsid):
     try:
         if decoded.get("type") == "UserStartedSpeaking":
@@ -105,13 +107,38 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
             logging.exception("twilio_receiver crashed")
             break
 
+# -------------------- Render health check & WS upgrade separation --------------------
+async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
+    return (status, [("Content-Type", content_type)], body.encode("utf-8"))
+
+# Only serve /health to plain-HTTP; let WS upgrades pass through
+async def process_request(path, request_headers):
+    upgrade = request_headers.get("Upgrade", "").lower()
+    if upgrade == "websocket":
+        logging.info("WS upgrade attempt path=%s subprotocols=%s",
+                     path, request_headers.get("Sec-WebSocket-Protocol"))
+        return None  # proceed with WS handshake
+    if path == "/health":
+        return await _http_response(200, "OK")
+    return await _http_response(404, "Not Found")
+
+# Restrict which WS paths are accepted (keeps noise & mistakes out)
+ALLOWED_WS_PATHS = {"/twilio", "/ws", "/"}
+
 # ✅ Handler compatible with both (websocket) and (websocket, path)
 async def twilio_handler(twilio_ws, path=None, *args):
     if path is None:
         # Newer websockets passes only (websocket); path is on the object
         path = getattr(twilio_ws, "path", "/")
-    if path != "/twilio":
-        logging.warning("Unexpected WS path: %s", path)
+
+    if path not in ALLOWED_WS_PATHS:
+        logging.warning("Rejecting unexpected WS path: %s", path)
+        try:
+            await twilio_ws.close(code=1008, reason="Invalid path")
+        finally:
+            return
+
+    logging.info("WS connected path=%s negotiated_subprotocol=%s", path, twilio_ws.subprotocol)
 
     audio_queue = asyncio.Queue()
     streamsid_queue = asyncio.Queue()
@@ -131,44 +158,35 @@ async def twilio_handler(twilio_ws, path=None, *args):
         except Exception:
             pass
 
-
-# Add this helper anywhere above main()
-async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
-    return (status, [("Content-Type", content_type)], body.encode("utf-8"))
-
-# Only serve plain HTTP for non-upgrade requests to /health
-async def process_request(path, request_headers):
-    # If client is attempting a WebSocket upgrade, let websockets do the handshake
-    upgrade = request_headers.get("Upgrade", "").lower()
-    if upgrade == "websocket":
-        return None  # proceed with WS handshake
-
-    # Plain HTTP health-check only
-    if path == "/health":
-        return await _http_response(200, "OK")
-
-    # For any other plain-HTTP path, send 404 (optional: 204)
-    return await _http_response(404, "Not Found")
-
-# OPTIONAL: if you want to require a specific WS path like "/twilio"
-ALLOWED_WS_PATHS = {"/", "/twilio", "/ws"}  # include the one your client actually uses
-
+# -------------------- Server bootstrap (Render-ready) --------------------
 async def main():
-    port = int(os.getenv("PORT", "5000"))  # fallback to 5000 for local dev
-    common_subprotocols = ["audio", "json", "twilio", "deepgram"]
+    # Render assigns a dynamic port via $PORT (falls back to 5000 for local dev)
+    port = int(os.environ.get("PORT", 5000))
+
+    # Subprotocols: Twilio requires "audio"; others might offer "json"/"deepgram"
+    advertised_subprotocols = ["audio", "json", "twilio", "deepgram"]
+
+    # Keepalive pings so idle connections don't get dropped by the PaaS
+    ping_interval = 20  # seconds between pings
+    ping_timeout = 20   # seconds to wait for pong
+
     server = await websockets.serve(
         twilio_handler,
         host="0.0.0.0",
         port=port,
-        process_request=process_request,  # /health for HTTP, None for upgrades
-        subprotocols=common_subprotocols, # negotiate Twilio/others cleanly
-        max_size=8 * 1024 * 1024          # optional: raise if you stream big frames
+        process_request=process_request,      # /health for HTTP; None for upgrades
+        subprotocols=advertised_subprotocols, # negotiate Twilio/others cleanly
+        max_size=8 * 1024 * 1024,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
     )
-    logging.info(f"Started server on 0.0.0.0:{port}")
+    logging.info("Started server on 0.0.0.0:%s", port)
     await server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 
