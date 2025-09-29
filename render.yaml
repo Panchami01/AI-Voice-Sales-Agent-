@@ -10,11 +10,10 @@ services:
     healthCheckPath: /
     envVars:
       - key: DEEPGRAM_API_KEY
-        sync: false             # set in Render dashboard as a secret
-      - key: OPENAI_API_KEY
-        sync: false             # if your agent uses OpenAI
+        sync: false             # set in Render dashboard as a secret        
       - key: PYTHON_VERSION
         value: 3.11.9           # known-good with websockets 11.x
+
 
 
 
