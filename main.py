@@ -36,7 +36,7 @@ async def handle_barge_in(decoded, twilio_ws, streamsid):
 
 async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
     await handle_barge_in(decoded, twilio_ws, streamsid)
-    # place function-calling or message handling here if needed
+    # add function-calling or other message handling here if needed
 
 async def sts_sender(sts_ws, audio_queue: asyncio.Queue):
     logging.info("sts_sender started")
@@ -57,7 +57,7 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue: asyncio.Queue):
                 decoded = json.loads(message)
                 await handle_text_message(decoded, twilio_ws, sts_ws, streamsid)
                 continue
-            # Binary presumed to be mulaw @ 8k (per your config)
+            # Binary presumed mulaw @ 8k (per config.json)
             raw_mulaw = message
             media_message = {
                 "event": "media",
@@ -92,7 +92,6 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
                 if not b64:
                     continue
                 chunk = base64.b64decode(b64)
-                # Twilio track may be "inbound" or "inbound_audio"
                 if media.get("track") in ("inbound", "inbound_audio"):
                     inbuffer.extend(chunk)
 
@@ -109,11 +108,10 @@ async def twilio_receiver(twilio_ws, sts_ws, audio_queue: asyncio.Queue, streams
             logging.exception("twilio_receiver crashed")
             break
 
-# -------------------- Render health check & WS upgrade separation --------------------
+# -------------------- Health check & upgrade separation --------------------
 async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
     return (status, [("Content-Type", content_type)], body.encode("utf-8"))
 
-# Only serve /health to plain-HTTP; let WS upgrades proceed untouched
 async def process_request(path, request_headers):
     upgrade = request_headers.get("Upgrade", "").lower()
     if upgrade == "websocket":
@@ -122,23 +120,20 @@ async def process_request(path, request_headers):
             path,
             request_headers.get("Sec-WebSocket-Protocol"),
         )
-        return None  # proceed with WS handshake
+        return None  # let WS handshake proceed
     if path == "/health":
         return await _http_response(200, "OK")
     return await _http_response(404, "Not Found")
 
-# Allowed *path components* (ignore querystrings)
 ALLOWED_WS_PATHS = {"/twilio", "/ws", "/"}
 
 def _is_allowed_ws_path(request_path: str) -> bool:
-    # urlparse to strip querystrings like /twilio?foo=bar
     pure_path = urlparse(request_path).path or "/"
     return pure_path in ALLOWED_WS_PATHS
 
-# ✅ Handler compatible with both (websocket) and (websocket, path)
+# Compatible with websockets API styles
 async def twilio_handler(twilio_ws, path=None, *args):
     if path is None:
-        # Newer websockets passes only (websocket); path is on the object
         path = getattr(twilio_ws, "path", "/")
 
     if not _is_allowed_ws_path(path):
@@ -168,24 +163,24 @@ async def twilio_handler(twilio_ws, path=None, *args):
         except Exception:
             pass
 
-# -------------------- Server bootstrap (Render-ready) --------------------
+# -------------------- Server bootstrap --------------------
 async def main():
+    # Railway provides $PORT automatically; keep 5000 fallback for local
     port = int(os.environ.get("PORT", 5000))
 
-    # Subprotocols: Twilio requires "audio".
-    # Keep the list minimal to guarantee selection when offered.
+    # Twilio requires "audio" subprotocol
     advertised_subprotocols = ["audio"]
 
-    # Keepalive pings to avoid idle disconnects on PaaS
-    ping_interval = 20  # seconds
-    ping_timeout = 20   # seconds
+    # Keepalive pings to avoid idle disconnects
+    ping_interval = 20
+    ping_timeout = 20
 
     server = await websockets.serve(
         twilio_handler,
         host="0.0.0.0",
         port=port,
         process_request=process_request,      # /health for HTTP; None for upgrades
-        subprotocols=advertised_subprotocols, # negotiate Twilio cleanly
+        subprotocols=advertised_subprotocols, # negotiate Twilio
         max_size=8 * 1024 * 1024,
         ping_interval=ping_interval,
         ping_timeout=ping_timeout,
@@ -195,6 +190,8 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 
