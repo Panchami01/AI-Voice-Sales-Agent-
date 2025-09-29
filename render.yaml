@@ -6,13 +6,14 @@ services:
     region: oregon
     rootDir: Voice Agent
     buildCommand: pip install -r requirements.txt
-    startCommand: python serve.py
+    startCommand: python server.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
       - key: DEEPGRAM_API_KEY
         sync: false   # add this in the Render Dashboard → Environment
+
 
 
 
