@@ -1,18 +1,22 @@
 services:
   - type: web
-    name: riverstone-voice-agent
+    name: voice-agent
     env: python
-    plan: starter
-    region: oregon
-    rootDir: Voice Agent
+    region: singapore           # closer to Australia; pick another if you prefer
+    plan: starter               # or free/pro as you need
     buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
-    healthCheckPath: /health
+    startCommand: python main.py
+    autoDeploy: true
+    healthCheckPath: /
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.6
       - key: DEEPGRAM_API_KEY
-        sync: false   # add this in the Render Dashboard → Environment
+        sync: false             # set in Render dashboard as a secret
+      - key: OPENAI_API_KEY
+        sync: false             # if your agent uses OpenAI
+      - key: PYTHON_VERSION
+        value: 3.11.9           # known-good with websockets 11.x
+
+
 
 
 
