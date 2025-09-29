@@ -136,13 +136,22 @@ async def twilio_handler(twilio_ws, path=None, *args):
 async def _http_response(status: int, body: str, content_type="text/plain; charset=utf-8"):
     return (status, [("Content-Type", content_type)], body.encode("utf-8"))
 
-# Minimal HTTP health-check for Render
-async def health_check(path, request_headers):
-    # Return 200 OK for "/" so Render’s health check passes
-    if path == "/":
+# Only serve plain HTTP for non-upgrade requests to /health
+async def process_request(path, request_headers):
+    # If client is attempting a WebSocket upgrade, let websockets do the handshake
+    upgrade = request_headers.get("Upgrade", "").lower()
+    if upgrade == "websocket":
+        return None  # proceed with WS handshake
+
+    # Plain HTTP health-check only
+    if path == "/health":
         return await _http_response(200, "OK")
-    # Let websockets proceed for upgrades; any other plain-HTTP path gets 404
+
+    # For any other plain-HTTP path, send 404 (optional: 204)
     return await _http_response(404, "Not Found")
+
+# OPTIONAL: if you want to require a specific WS path like "/twilio"
+ALLOWED_WS_PATHS = {"/", "/twilio", "/ws"}  # include the one your client actually uses
 
 async def main():
     port = int(os.getenv("PORT", "5000"))  # fallback to 5000 for local dev
@@ -152,6 +161,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
